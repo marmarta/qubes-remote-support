@@ -1,17 +1,26 @@
 #!/bin/bash
 
-set -x
 set -e
 
-## TODO: Packaging should make sure these packages are installed in dom0
-##       before proceeding.
-#sudo qubes-dom0-update socat openssh-server x2goserver
+vm_name="$2"
+if [ "$vm_name" = "" ]; then
+    vm_name="sys-whonix"
+fi
 
-## TODO: do not hardcode sys-whonix - make that an environment variable or command line parameter
+dom0_check_dependencies() {
+   ## Packaging should make sure these packages are installed in dom0 before proceeding.
+   #sudo qubes-dom0-update torsocks socat openssh-server x2goserver
+
+   command -v torsocks >/dev/null || { echo "ERROR: missing torsocks" >&2 ; exit 101; };
+   command -v socat >/dev/null || { echo "ERROR: missing socat" >&2 ; exit 102; };
+   command -v sshd >/dev/null || { echo "ERROR: missing sshd" >&2 ; exit 103; };
+
+   ## x2goserver is optional.
+}
 
 no_root_check() {
     if [ "$(id -u)" = "0" ]; then
-        echo "ERROR: Do not run $0 as root / with sudo!"
+        echo "ERROR: Do not run $0 as root / with sudo!" >&2
         exit 100
     fi
 }
@@ -73,6 +82,52 @@ colors() {
    } 2>/dev/null ||:
 }
 
+dom0_exit_handler() {
+    if [ ! "$socat_pid" = "" ]; then
+       kill -s sigterm "$socat_pid" &>/dev/null || true
+    fi
+}
+
+dom0_run_socat() {
+   ## Running this function early to allow socat to be launched into the background.
+
+   ## We could run "sudo killall socat" or "pkill socat" or similar before.
+   ## This would be useful to clean up leftover socat processes.
+   ## In some race conditions the following might fail due to leftover socat
+   ## processes from previous runs. (Socat would write that port is already in
+   ## use by another application and GUI would detect that as error since
+   ## written to stderr.)
+
+   ## By Qubes default, dom0 is non-networked.
+   ## Use socat in combination with torsocks to allow running wormhole directly
+   ## from Qubes dom0. This is to make VMs untrusted. I.e. a compromised VM
+   ## should not get access to dom0 SSH server keys.
+   ## In other words, allow running "torsocks wormhole" in dom0.
+   ## (As executed by qubes-remote-support-receiver-wormhole-helper.)
+   ##
+   ## Listen with socat on port 9050 (this is where Tor would listen if this was not dom0).
+   ## torsocks with its default configuration will use port 9050.
+   ##
+   ## We could use any dom0 port other than 9050.
+   ## For that we would have to use something like this:
+   ## TORSOCKS_CONF_FILE=/path/to/qubes-remote-support-torsocks-config torsocks
+   ## But since nothing should be listening on port 9050 in dom0 the choice of
+   ## this port is appropriate at a small expense of breakage if Tor was
+   ## installed in dom0 with default configuration which really should not be
+   ## the case in dom0.
+   ##
+   ## Port number 9122 is an arbitrarily chosen unused Tor SocksPort inside Whonix-Gateway.
+   socat TCP-LISTEN:9050,reuseaddr,fork "EXEC:qrexec-client -d $vm_name user\:\'\''/etc/qubes-rpc/qubes.ConnectTCP 9122\'\''" &
+   socat_pid="$!"
+
+   ## socat TCP-LISTEN:9050,reuseaddr,fork 'EXEC:qrexec-client -d sys-whonix user\:\'\''/etc/qubes-rpc/qubes.ConnectTCP 9122\'\'''
+
+   ## Make sure socat is really started. Otherwise if script exits early,
+   ## dom0_exit_handler might not have a chance killing socat. And leftover
+   ## socat process could break subsequent run of this script.
+   sleep 2
+}
+
 dom0_rpc_policy_setup() {
     local append_string
 
@@ -86,7 +141,7 @@ dom0_rpc_policy_setup() {
 
     test -r /etc/qubes-rpc/policy/qubes.ConnectTCP+22
 
-    append_string="sys-whonix dom0 allow,target=dom0"
+    append_string="$vm_name dom0 allow,target=dom0"
     if grep --quiet "$append_string" /etc/qubes-rpc/policy/qubes.ConnectTCP+22 ; then
         true "INFO: /etc/qubes-rpc/policy/qubes.ConnectTCP+22 added modified."
     else
@@ -94,13 +149,13 @@ dom0_rpc_policy_setup() {
     fi
 
     ## Debugging.
-    cat /etc/qubes-rpc/policy/qubes.ConnectTCP+22
+    #cat /etc/qubes-rpc/policy/qubes.ConnectTCP+22
 }
 
 dom0_sshd_hardening() {
     local old new file_name
     if ! test -e /etc/ssh/sshd_config ; then
-        true "ERROR: file /etc/ssh/sshd_config does not exist!"
+        echo "ERROR: file /etc/ssh/sshd_config does not exist!" >&2
         exit 1
     fi
     ## dom0 minimal sshd configuration hardening
@@ -111,39 +166,41 @@ dom0_sshd_hardening() {
 }
 
 check_vm_installed() {
-    qvm-check sys-whonix
+    qvm-check "$vm_name" 2>/dev/null
 }
 
 start_vm() {
-    if qvm-check --running sys-whonix ; then
+    if qvm-check --running "$vm_name" 2>/dev/null ; then
         true "INFO: already running, ok."
     else
         ## Would exit non-zero if already running.
         true "INFO: Not yet running, starting..."
-        qvm-start sys-whonix
+        qvm-start "$vm_name" 2>/dev/null
     fi
 }
 
 vm_setup() {
     ## --pass-io is optional but useful for gathering debug output.
 
-    qvm-run --user root --pass-io sys-whonix "systemctl restart qubes-whonix-remote-support.service"
+    qvm-run --user root --pass-io "$vm_name" "systemctl start tor" >/dev/null
 
-    qvm-run --user root --pass-io sys-whonix "systemctl --no-pager --no-block status qubes-whonix-remote-support.service"
+    qvm-run --user root --pass-io "$vm_name" "systemctl restart qubes-whonix-remote-support.service" >/dev/null
 
-    qvm-run --user root --pass-io sys-whonix "virtport=22 hsport=22 hsname=remote_support client=1 anon-auth-autogen"
+    qvm-run --user root --pass-io "$vm_name" "systemctl --no-pager --no-block status qubes-whonix-remote-support.service" >/dev/null
+
+    qvm-run --user root --pass-io "$vm_name" "virtport=22 hsport=22 hsname=remote_support client=1 anon-auth-autogen" >/dev/null
 }
 
 dom0_get_tor_auth_private() {
-    dom0_copy_from_vm sys-whonix /var/lib/tor_autogen/remote_support/1.auth_private "$temp_dir/keys/1.auth_private"
+    dom0_copy_from_vm "$vm_name" /var/lib/tor_autogen/remote_support/1.auth_private "$temp_dir/keys/1.auth_private"
 
-    ## TODO: remove debugging
-    cat "$temp_dir/keys/1.auth_private"
+    ## Debugging.
+    #cat "$temp_dir/keys/1.auth_private"
 
-    dom0_copy_from_vm sys-whonix /var/lib/tor/remote_support/hostname "$temp_dir/keys/hostname"
+    dom0_copy_from_vm "$vm_name" /var/lib/tor/remote_support/hostname "$temp_dir/keys/hostname"
 
-    ## TODO: remove debugging
-    cat "$temp_dir/keys/hostname"
+    ## Debugging.
+    #cat "$temp_dir/keys/hostname"
 }
 
 dom0_sshd_setup() {
@@ -157,7 +214,7 @@ dom0_sshd_setup() {
     ## Creates files:
     ## - $temp_dir/keys/id_ed25519
     ## - $temp_dir/keys/id_ed25519.pub
-    ssh-keygen -t ed25519 -f "$temp_dir/keys/id_ed25519" -N "" -C "qubes-remote-support-receiver-auto-generated"
+    ssh-keygen -t ed25519 -f "$temp_dir/keys/id_ed25519" -N "" -C "qubes-remote-support-receiver-auto-generated" >/dev/null
 
     mkdir -p ~/.ssh
     sudo chmod 700 ~/.ssh
@@ -168,12 +225,13 @@ dom0_sshd_setup() {
     echo "$append_string" | tee --append ~/.ssh/authorized_keys >/dev/null
 
     ## systemctl enable not required.
-    sudo systemctl restart sshd.service
-    sudo systemctl --no-pager --no-block status sshd.service
+    sudo systemctl restart sshd.service >/dev/null
+    sudo systemctl --no-pager --no-block status sshd.service >/dev/null
 }
 
 dom0_sshd_fingerprint() {
-    ssh_keyscan_output="$(ssh-keyscan -t ed25519 -H 127.0.0.1)"
+    ## 2>/dev/null to hide stderr "# 127.0.0.1:22 SSH-2.0-OpenSSH_7.4"
+    ssh_keyscan_output="$(ssh-keyscan -t ed25519 -H 127.0.0.1 2>/dev/null)"
     ## example output stderr:
     ## # 127.0.0.1:22 SSH-2.0-OpenSSH_7.4
     ## example output stdout:
@@ -202,20 +260,20 @@ dom0_sshd_fingerprint() {
     ## Could not figure out to use this with known_hosts file.
 
     ## Debugging.
-    cat "$temp_dir/keys/ssh_algorithm"
-    cat "$temp_dir/keys/ssh_fingerprint"
+    #cat "$temp_dir/keys/ssh_algorithm"
+    #cat "$temp_dir/keys/ssh_fingerprint"
 }
 
 dom0_x2go_setup() {
-    sudo x2godbadmin --createdb
+    sudo x2godbadmin --createdb >/dev/null
     ## systemctl enable not required.
-    #sudo systemctl enable x2gocleansessions.service
-    sudo systemctl restart x2gocleansessions.service
-    sudo systemctl --no-pager --no-block status x2gocleansessions.service
+    #sudo systemctl enable x2gocleansessions.service >/dev/null
+    sudo systemctl restart x2gocleansessions.service >/dev/null
+    sudo systemctl --no-pager --no-block status x2gocleansessions.service >/dev/null
 }
 
 dom0_create_key_files_archive() {
-    tar -zcvf "$temp_dir/remote-support-keys.tar.gz" -C "$temp_dir" keys
+    tar -zcvf "$temp_dir/remote-support-keys.tar.gz" -C "$temp_dir" keys >/dev/null
 }
 
 wormhole_send_wrapper() {
@@ -237,26 +295,26 @@ wormhole_send_wrapper() {
         if [ "$first" = "wormhole" ]; then
             if [ "$second" = "receive" ]; then
                 true "${green}${bold}INFO: next line is wormhole code.${reset}"
-                echo "$third"
+                echo "wormhole_code: $third"
                 found=yes
             fi
         fi
-        ## wormhole writes to stderr, hence we must use 2>&1 to redirect to stdout,
-        ## so bash's "while read" can access it.
 
-    ## wormhole_tool_
-    ## - run either 'wormhole send' directly
-    ## - or run qubes-remote-support-receiver-wormhole-helper which runs it in a DispVM.
-    done < <( $wormhole_tool "$temp_dir/remote-support-keys.tar.gz" 2>&1 )
+    ## wormhole writes to stderr, hence we must use 2>&1 to redirect to stdout,
+    ## so bash's "while read" can access it.
+    done < <( qubes-remote-support-receiver-wormhole-helper "$temp_dir/remote-support-keys.tar.gz" 2>&1 )
 
     if [ "$found" = "no" ]; then
-        true "${red}${bold}ERROR: wormhole issue.${reset}"
+        echo "${red}${bold}ERROR: wormhole issue.${reset}" >&2
     fi
 }
 
 no_root_check
+dom0_check_dependencies
 preparation
 colors
+trap dom0_exit_handler EXIT
+dom0_run_socat
 dom0_rpc_policy_setup
 dom0_sshd_hardening
 check_vm_installed
@@ -267,18 +325,6 @@ dom0_sshd_setup
 dom0_sshd_fingerprint
 dom0_x2go_setup
 dom0_create_key_files_archive
-
-## TODO: What do we do about Qubes R4.0 vs missing magic-wormhole?
-if command -v wormhole >/dev/null ; then
-    ## wormhole available in dom0
-    ## TODO: not implemented yet due to lacking available wormhole in dom0
-    wormhole_tool=wormhole
-else
-    ## Starting a DispVM good enough until Qubes R4.1?
-    ## TODO: path
-    wormhole_tool=~/qubes-remote-support-receiver-wormhole-helper
-fi
-
 wormhole_send_wrapper
 
 true "INFO: Success."
